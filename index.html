@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f6feb">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Sổ tay</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font-family:system-ui,-apple-system,Roboto,sans-serif;background:#f4f6fa;color:#1c2330}
+#app{max-width:560px;margin:0 auto;min-height:100vh;padding:16px 16px 140px}
+h1{font-size:22px;margin:8px 0 4px}
+.sub{color:#5b6677;font-size:14px;margin-bottom:16px;line-height:1.45}
+input,textarea{width:100%;padding:13px 14px;font-size:16px;border:1px solid #cfd6e2;border-radius:12px;background:#fff;color:inherit;font-family:inherit}
+textarea{min-height:80px;resize:vertical}
+label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px;color:#3a4558}
+button{font-size:16px;font-family:inherit;border:0;border-radius:12px;padding:13px 16px;cursor:pointer}
+.primary{background:#1f6feb;color:#fff;width:100%;font-weight:600;margin-top:18px}
+.ghost{background:#e6ebf4;color:#1c2330}
+.danger{background:#fde8e8;color:#b42318}
+.row{display:flex;gap:8px;align-items:center}
+.row>*{flex:1}
+.row>button{flex:0 0 auto}
+.card{background:#fff;border-radius:14px;padding:14px;margin-top:10px;box-shadow:0 1px 3px rgba(20,30,50,.08)}
+.card .t{font-weight:700;font-size:17px;word-break:break-word}
+.card .u{color:#5b6677;font-size:14px;margin-top:2px;word-break:break-all}
+.card .p{font-family:ui-monospace,Menlo,monospace;font-size:15px;margin-top:8px;word-break:break-all}
+.card .n{color:#5b6677;font-size:13px;margin-top:6px;white-space:pre-wrap;word-break:break-word}
+.card .btns{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.card .btns button{padding:10px 8px;font-size:14px;flex:1 1 0}
+.card .btns button[data-act=edit]{flex:1 1 100%}
+.addbtn{display:block;width:100%;margin-top:12px;background:#1f6feb;color:#fff;font-size:18px;font-weight:700;padding:15px 16px;border-radius:14px;box-shadow:0 4px 14px rgba(31,111,235,.35)}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.top button{padding:9px 12px;font-size:14px}
+.err{color:#b42318;font-size:14px;margin-top:10px;min-height:18px}
+.warn{background:#fff6e0;border:1px solid #f0d58a;border-radius:12px;padding:12px;font-size:14px;line-height:1.45;margin-top:12px}
+.empty{text-align:center;color:#7a8597;margin-top:48px;line-height:1.6}
+#toast{position:fixed;left:50%;bottom:100px;transform:translateX(-50%);background:#1c2330;color:#fff;padding:10px 16px;border-radius:20px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .2s}
+#toast.on{opacity:.95}
+.foot{margin-top:24px;display:flex;gap:8px;flex-wrap:wrap}
+.foot button{flex:1;font-size:14px;padding:11px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<input type="file" id="imp" accept=".json,application/json" hidden>
+
+<script>
+const STORE = 'sotay_v1';
+const ITER = 250000;
+const AUTOLOCK_MS = 2 * 60 * 1000;
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+let key = null, salt = null, entries = [], lockTimer = null, hideTimer = null, query = '';
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function b2s(buf){ const a = new Uint8Array(buf); let s=''; for(let i=0;i<a.length;i++) s+=String.fromCharCode(a[i]); return btoa(s); }
+function s2b(s){ return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
+
+async function derive(pw, saltBytes, iter){
+  const base = await crypto.subtle.importKey('raw', enc.encode(pw), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2', salt:saltBytes, iterations:iter, hash:'SHA-256'}, base,
+    {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+}
+async function save(){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, enc.encode(JSON.stringify(entries)));
+  localStorage.setItem(STORE, JSON.stringify({v:1, iter:ITER, salt:b2s(salt), iv:b2s(iv), data:b2s(ct)}));
+}
+function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('on'); setTimeout(()=>t.classList.remove('on'),1600); }
+
+function resetTimer(){
+  clearTimeout(lockTimer);
+  if(key) lockTimer = setTimeout(lock, AUTOLOCK_MS);
+}
+function lock(){ key=null; entries=[]; query=''; render(); }
+['click','touchstart','keydown'].forEach(e => document.addEventListener(e, resetTimer, {passive:true}));
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(hideTimer);
+  if(document.hidden && key) hideTimer = setTimeout(lock, 30000);
+});
+
+function render(){
+  if(!localStorage.getItem(STORE)) return viewSetup();
+  if(!key) return viewLock();
+  viewList();
+}
+
+function viewSetup(){
+  $('#app').innerHTML = `
+    <h1>🔐 Sổ tay tài khoản</h1>
+    <div class="sub">Lần đầu dùng: tạo mật khẩu chủ. Mọi dữ liệu được mã hóa bằng mật khẩu này và chỉ nằm trong máy mày.</div>
+    <label>Mật khẩu chủ (từ 6 ký tự)</label>
+    <input id="p1" type="password" autocomplete="new-password">
+    <label>Nhập lại mật khẩu chủ</label>
+    <input id="p2" type="password" autocomplete="new-password">
+    <div class="warn">⚠️ Quên mật khẩu chủ là <b>mất hết dữ liệu</b>, không ai khôi phục được. Hãy nhớ kỹ, và thỉnh thoảng bấm "Sao lưu" để cất file dự phòng.</div>
+    <div class="err" id="err"></div>
+    <button class="primary" id="go">Tạo sổ tay</button>
+    <div class="foot"><button class="ghost" id="imp-btn">Khôi phục từ file sao lưu</button></div>`;
+  $('#go').onclick = async () => {
+    const a=$('#p1').value, b=$('#p2').value;
+    if(a.length<6) return $('#err').textContent='Mật khẩu tối thiểu 6 ký tự.';
+    if(a!==b) return $('#err').textContent='Hai lần nhập chưa khớp.';
+    $('#go').disabled=true; $('#go').textContent='Đang tạo...';
+    salt = crypto.getRandomValues(new Uint8Array(16));
+    key = await derive(a, salt, ITER); entries = [];
+    await save();
+    if(navigator.storage && navigator.storage.persist) navigator.storage.persist();
+    resetTimer(); render();
+  };
+  $('#imp-btn').onclick = () => $('#imp').click();
+}
+
+function viewLock(){
+  $('#app').innerHTML = `
+    <h1>🔐 Sổ tay tài khoản</h1>
+    <div class="sub">Nhập mật khẩu để mở.</div>
+    <input id="pw" type="password" autocomplete="current-password" placeholder="Nhập mật khẩu">
+    <div class="err" id="err"></div>
+    <button class="primary" id="go">Mở khóa</button>
+    <div class="foot"><button class="ghost" id="imp-btn">Khôi phục từ file sao lưu</button></div>`;
+  const go = async () => {
+    const pw = $('#pw').value; if(!pw) return;
+    $('#go').disabled=true; $('#go').textContent='Đang mở...';
+    try{
+      const o = JSON.parse(localStorage.getItem(STORE));
+      const s = s2b(o.salt);
+      const k = await derive(pw, s, o.iter || ITER);
+      const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv:s2b(o.iv)}, k, s2b(o.data));
+      entries = JSON.parse(dec.decode(pt)); key = k; salt = s;
+      resetTimer(); render();
+    }catch(e){
+      $('#go').disabled=false; $('#go').textContent='Mở khóa';
+      $('#err').textContent='Sai mật khẩu.'; $('#pw').select();
+    }
+  };
+  $('#go').onclick = go;
+  $('#pw').addEventListener('keydown', e => { if(e.key==='Enter') go(); });
+  $('#imp-btn').onclick = () => $('#imp').click();
+}
+
+function viewList(){
+  const q = query.trim().toLowerCase();
+  const list = entries.filter(e => !q || (e.title+' '+e.user+' '+e.note).toLowerCase().includes(q))
+                      .sort((a,b)=>a.title.localeCompare(b.title,'vi'));
+  $('#app').innerHTML = `
+    <div class="top"><h1>🔐 Sổ tay</h1><button class="ghost" id="lk">Khóa</button></div>
+    <input id="q" type="search" placeholder="Tìm theo tên, tài khoản, ghi chú..." value="${esc(query)}">
+    <div id="items">${list.length ? list.map(card).join('') :
+      `<div class="empty">${entries.length?'Không tìm thấy mục nào.':'Chưa có gì.<br>Bấm nút <b>+</b> để thêm tài khoản đầu tiên.'}</div>`}</div>
+    <div class="foot">
+      <button class="ghost" id="exp">Sao lưu</button>
+      <button class="ghost" id="imp-btn">Khôi phục</button>
+      <button class="ghost" id="chg">Đổi mật khẩu đăng nhập</button>
+    </div>
+    <button class="addbtn" id="add">+ Thêm tài khoản</button>`;
+  $('#lk').onclick = lock;
+  $('#q').oninput = e => { query = e.target.value; const pos=e.target.selectionStart; viewList(); const n=$('#q'); n.focus(); n.setSelectionRange(pos,pos); };
+  $('#add').onclick = () => viewEdit();
+  $('#exp').onclick = exportBackup;
+  $('#imp-btn').onclick = () => $('#imp').click();
+  $('#chg').onclick = changeMaster;
+  document.querySelectorAll('[data-act]').forEach(b => b.onclick = () => act(b.dataset.act, b.dataset.id, b));
+}
+function card(e){
+  return `<div class="card">
+    <div class="t">${esc(e.title)}</div>
+    ${e.user?`<div class="u">${esc(e.user)}</div>`:''}
+    <div class="p" id="pw-${e.id}">••••••••••</div>
+    ${e.note?`<div class="n">${esc(e.note)}</div>`:''}
+    <div class="btns">
+      <button class="ghost" data-act="show" data-id="${e.id}">Hiện</button>
+      <button class="ghost" data-act="cu" data-id="${e.id}">Copy TK</button>
+      <button class="ghost" data-act="cp" data-id="${e.id}">Copy MK</button>
+      <button class="ghost" data-act="edit" data-id="${e.id}">Thay đổi thông tin</button>
+    </div></div>`;
+}
+async function copy(text){
+  try{ await navigator.clipboard.writeText(text); }
+  catch(_){ const t=document.createElement('textarea'); t.value=text; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); }
+}
+async function act(a, id, btn){
+  const e = entries.find(x => x.id===id); if(!e) return;
+  if(a==='show'){
+    const el = $('#pw-'+id); const shown = btn.textContent==='Ẩn';
+    el.textContent = shown ? '••••••••••' : (e.pass || '(trống)'); btn.textContent = shown ? 'Hiện' : 'Ẩn';
+  } else if(a==='cu'){ await copy(e.user||''); toast('Đã copy tài khoản'); }
+  else if(a==='cp'){ await copy(e.pass||''); toast('Đã copy mật khẩu'); }
+  else if(a==='edit') viewEdit(e);
+}
+
+function genPass(len=16){
+  const set='abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*';
+  const r = crypto.getRandomValues(new Uint32Array(len)); let s='';
+  for(let i=0;i<len;i++) s+=set[r[i]%set.length]; return s;
+}
+function viewEdit(e){
+  const isNew = !e; e = e || {id:'', title:'', user:'', pass:'', note:''};
+  $('#app').innerHTML = `
+    <div class="top"><h1>${isNew?'Thêm mới':'Thay đổi thông tin'}</h1><button class="ghost" id="back">Hủy</button></div>
+    <label>Tên (web / app / ngân hàng...)</label><input id="f-t" value="${esc(e.title)}" autocomplete="off">
+    <label>Tài khoản / email / số điện thoại</label><input id="f-u" value="${esc(e.user)}" autocomplete="off" autocapitalize="off">
+    <label>Mật khẩu</label>
+    <div class="row"><input id="f-p" type="text" value="${esc(e.pass)}" autocomplete="off" autocapitalize="off"><button class="ghost" id="gen">Tạo ngẫu nhiên</button></div>
+    <label>Ghi chú</label><textarea id="f-n">${esc(e.note)}</textarea>
+    <div class="err" id="err"></div>
+    <button class="primary" id="ok">Lưu</button>
+    ${isNew?'':'<button class="danger primary" id="del" style="margin-top:10px">Xóa mục này</button>'}`;
+  $('#back').onclick = viewList;
+  $('#gen').onclick = () => { $('#f-p').value = genPass(); };
+  $('#ok').onclick = async () => {
+    const t = $('#f-t').value.trim();
+    if(!t) return $('#err').textContent='Nhập tên cho mục này.';
+    const rec = {id: e.id || crypto.randomUUID(), title:t, user:$('#f-u').value.trim(), pass:$('#f-p').value, note:$('#f-n').value.trim()};
+    if(isNew) entries.push(rec); else entries[entries.findIndex(x=>x.id===e.id)] = rec;
+    await save(); toast('Đã lưu'); viewList();
+  };
+  if(!isNew) $('#del').onclick = async () => {
+    if(!confirm('Xóa mục "'+e.title+'"? Không khôi phục được.')) return;
+    entries = entries.filter(x=>x.id!==e.id); await save(); viewList();
+  };
+}
+
+function exportBackup(){
+  const raw = localStorage.getItem(STORE);
+  const blob = new Blob([raw], {type:'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  const d = new Date(); a.download = `sotay-sao-luu-${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  toast('File sao lưu đã được mã hóa');
+}
+$('#imp').addEventListener('change', async ev => {
+  const f = ev.target.files[0]; ev.target.value=''; if(!f) return;
+  try{
+    const txt = await f.text(); const o = JSON.parse(txt);
+    if(!o.salt || !o.iv || !o.data) throw 0;
+    if(localStorage.getItem(STORE) && !confirm('Khôi phục sẽ GHI ĐÈ dữ liệu hiện tại trong máy. Tiếp tục?')) return;
+    localStorage.setItem(STORE, txt); key=null; entries=[];
+    toast('Đã nạp. Nhập mật khẩu chủ của file sao lưu để mở.'); render();
+  }catch(_){ alert('File không đúng định dạng sao lưu của sổ tay.'); }
+});
+async function changeMaster(){
+  const a = prompt('Nhập mật khẩu đăng nhập MỚI (từ 6 ký tự):'); if(a===null) return;
+  if(a.length<6) return alert('Mật khẩu tối thiểu 6 ký tự.');
+  const b = prompt('Nhập lại mật khẩu đăng nhập mới:'); if(a!==b) return alert('Hai lần nhập chưa khớp.');
+  salt = crypto.getRandomValues(new Uint8Array(16)); key = await derive(a, salt, ITER);
+  await save(); toast('Đã đổi mật khẩu đăng nhập');
+}
+
+render();
+if('serviceWorker' in navigator){ window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{})); }
+</script>
+</body>
+</html>
